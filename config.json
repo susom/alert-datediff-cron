@@ -1,5 +1,5 @@
 {
-	"name": "AlertDateDiffCron",
+	"name": "Alert DateDiff Cron",
 
 	"namespace": "Stanford\\AlertDateDiffCron",
 
@@ -37,7 +37,6 @@
 	},
 
 	"no-auth-pages": [
-
 	],
 
 	"project-settings": [
@@ -52,7 +51,7 @@
 	"system-settings": [
         {
             "key": "hours-between-batches",
-            "name": "<b>Hours between Full Runs</b>Enter the number of hours between batch runs",
+            "name": "<b>Hours between Full Runs</b> Enter the number of hours between batch runs",
             "required": false,
             "type": "dropdown",
             "choices": [
@@ -96,7 +95,7 @@
         },
 		{
 			"key": "enable-system-debug-logging",
-			"name": "<b>Enable Debug Logging (system-wide)</b><i>(optional)</i> Requires installation and configuration of emLogger",
+			"name": "<b>Enable Debug Logging (system-wide)</b> <i>(optional)</i> Requires installation and configuration of emLogger",
 			"required": false,
 			"type": "checkbox"
 		}

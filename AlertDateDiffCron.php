@@ -5,7 +5,6 @@ require_once "emLoggerTrait.php";
 
 use Alerts;
 use REDCap;
-use BenMorel\GsmCharsetConverter\Packer;
 
 class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
 
@@ -20,6 +19,8 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
     public $lastBatch;
     public $alertHistory;  // an array with one entry for each alert_id with the most recent completion results
 
+    private $batch_info;
+
     // current-batch                The current batch timestamp
     // current-alert
     // current-batch-process-id     The pid of the original batch
@@ -27,15 +28,15 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
 
     public function __construct() {
 		parent::__construct();
-		// Other code to run when object is instantiated
 
+		// Other code to run when object is instantiated
         $this->processId = getmypid();
         $this->ts_start = microtime(true);
     }
 
 
     /**
-     * Get EM runtime
+     * Get EM runtime based on ts_start
      * @return float|int
      */
 	public function getRunTime() {
@@ -44,8 +45,18 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
 
 
     /**
+     * Load the batch info
+     */
+    public function getBatchInfo() {
+	    $this->batch_info = $this->getSystemSetting("batch-info");
+
+    }
+
+
+    /**
      * Called periodically to see if the cron has crashed
      * @param $cron
+     * @return false
      */
 	public function cronCheckQueue( $cron ) {
         // $this->emDebug("Cron Fired", $cron);
@@ -122,7 +133,8 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
 
 
     /**
-     * Start processing in batch
+     * Start processing of new batch
+     * batch is named based on timestamp of now
      * @param $cron
      * @return false
      */
@@ -136,14 +148,16 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
 
         // Get the minimum hours between batches
         $hoursBetweenBatches = $this->getSystemSetting("hours-between-batches");
+        $minBetweenBatches = $hoursBetweenBatches * 60;
 
-        // How long has it been since the last batch:
+        // How long has it been since the last batch
         $minSinceLastBatch = ( $this->batch - $lastBatch ) / 60;
-        $this->emDebug("It has been $minSinceLastBatch mins since the last batch was started");
 
-        if ($hoursBetweenBatches * 60 > $minSinceLastBatch) {
-            $this->emDebug("Not time for next batch yet...");
+        if ($minBetweenBatches > $minSinceLastBatch) {
+            $this->emDebug("$minSinceLastBatch minutes since last batch is less than defined gap of $minBetweenBatches mins so we will skip.");
             return false;
+        } else {
+            $this->emDebug("Min since last batch: $minSinceLastBatch minutes is more than $minBetweenBatches so we will check to start");
         }
 
         // Check if last batch completed
@@ -240,16 +254,13 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
     }
 
 
-
-
     /**
-     * Actually process the alert for notifications
+     * Actually process the alert for notifications one at a time
      * @param $project_id
      * @param $alert_id
      * @return array|false
      */
 	public function checkProjectAlert($project_id, $alert_id) {
-        // checkAlertsBulk($project_id=null, $datediffsOnly=false, $alert_ids=array())
         if (empty($alert_id) || empty($project_id)) {
             $this->emError("Project and Alert ID REQUIRED");
             return false;
@@ -258,6 +269,7 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
         $ts = microtime(true);
 
         $Alerts = empty($this->Alerts) ? new Alerts : $this->Alerts;
+        // checkAlertsBulk($project_id=null, $datediffsOnly=false, $alert_ids=array())
         list($num_scheduled_total, $num_removed_total, $count_records_affected) = $Alerts->checkAlertsBulk($project_id, true, $alert_id);
 
         $duration_ms = (microtime(true) - $ts) * 1000;
@@ -271,12 +283,8 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
             'duration' => $duration_ms
         ];
 
-        // Log it
-        // $this->emDebug($results);
-
         return $results;
     }
-
 
 
     /**
