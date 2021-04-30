@@ -318,7 +318,7 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
 
         if (empty($queue)) {
             $batchInfo['end_ts'] = microtime(true);
-            $this->emDebug("Batch Complete", $batchInfo);
+            $this->emDebug("Batch Complete", json_encode($batchInfo));
             $batchLog = [];
             foreach ($batchInfo as $k => $v) {
                 if (is_array($v)) {
@@ -405,6 +405,10 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
             'count_affected' => $count_records_affected,
             'duration' => $duration
         ];
+
+        if ($num_scheduled_total > 0) {
+            $this->emDebug("Scheduled $num_scheduled_total for alert $alert_id in project $project_id");
+        }
 
         return $results;
     }
