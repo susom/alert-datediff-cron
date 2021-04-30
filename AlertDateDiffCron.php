@@ -4,22 +4,28 @@ namespace Stanford\AlertDateDiffCron;
 require_once "emLoggerTrait.php";
 
 use Alerts;
+use BenMorel\GsmCharsetConverter\Packer;
 use REDCap;
 
 class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
 
     use emLoggerTrait;
 
-    public $batch;
-    public $processId;
-    public $queue;
-    public $retries;
-    public $Alerts;
-    public $ts_start;
-    public $lastBatch;
-    public $alertHistory;  // an array with one entry for each alert_id with the most recent completion results
+    public $batchInfo;
 
-    private $batch_info;
+
+    public $pid;              // Process ID of the current EM instance
+    public $pid_alert_count;  // Number of alerts processed in the current thread
+    public $ts_start;        // Time the EM was initialized
+    public $Alerts;             // A cache for the Alerts object
+
+    // public $queue;
+    // public $retries;
+    // public $Alerts;
+    // public $lastBatch;
+    // public $alertHistory;  // an array with one entry for each alert_id with the most recent completion results
+
+    // private $batch_info;
 
     // current-batch                The current batch timestamp
     // current-alert
@@ -30,232 +36,349 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
 		parent::__construct();
 
 		// Other code to run when object is instantiated
-        $this->processId = getmypid();
+        $this->pid = getmypid();
         $this->ts_start = microtime(true);
+        $this->pid_alert_count = 1;   // The number of alerts processed in the current pid
     }
 
 
     /**
-     * Get EM runtime based on ts_start
+     * Called periodically to see if the last batch has crashed and needs to be resumed
+     * @param $cron
+     * @return false
+     */
+    public function cronCheckBatchProcess( $cron ) {
+        // $this->emDebug("Cron Fired", $cron);
+
+        # SEE IF PROCESS IS OR WAS RUNNING
+        $currentAlert = $this->getSystemSetting("current-alert");
+        $batchInfo = $this->getBatchInfo();
+        $queue = $batchInfo['queue'];
+        $batchPid = $batchInfo['pid'] ?? 0;
+
+        if (empty($currentAlert)) {
+            // Empty currentAlert suggests batch cron process is complete
+
+            // Verify queue is empty as it should if there is nothing in the currentAlert
+            if (!empty($queue)) {
+                // QUEUE is not empty but there is no current alert.  This shouldn't happen
+                $this->emError("currentAlert is empty but queue is not.  This shouldn't happen", $batchInfo, "Current PID: " . posix_getpid());
+                return false;
+            }
+
+            // How long has it been since the last batch to see if we need to start a new batch process
+            if (!$this->isTimeForNextBatch()) {
+                $this->emDebug("Waiting until next check");
+                return true;
+            }
+
+            // It is time to start a new batch
+            $this->emDebug("Starting new batch");
+            $this->startNewBatch();
+
+        } else {
+            // currentAlert is not empty indicating a potential crash or still running
+
+            // Check if still running
+            if (posix_getpgid($batchPid)) {
+                $runTimeInMin = round($this->getRunTime($batchInfo['start_ts']) / 60,0);
+                $this->emDebug("Batch pid $batchPid is still running - has been running for $runTimeInMin minutes - exiting");
+                return true;
+            }
+
+            // Check for empty queue - This really shouldn't happen as the currentAlert should be clear
+            if (empty($queue)) {
+                $this->emError("The queue is empty even though the currentAlert is not.  This shouldn't happen!  Clearing the currentAlert", $currentAlert);
+                $this->setSystemSetting('current-alert','');
+                return true;
+            }
+
+            // Assume PID is NOT running and we have a crash - we can either restart the previous batch process or start a new one
+            $this->emDebug("It appears batch (pid $batchPid) from " . $batchInfo['start_ts'] . " has died on alert " .
+                $currentAlert['alert_id'] . " with " . count($queue) . " alerts left to complete.");
+
+            // See if it is time for a 'new' batch or to restart this batch
+            if ($this->isTimeForNextBatch()) {
+                // Time to start over
+                $this->emError("Aborting previous batch and starting over, Skipping the following alerts:", $batchInfo);
+                $this->emailAlert("Last batch did not finish.\n\nSkipped remaining Alert Queue:\n<pre>".print_r($batchInfo,true)."</pre>");
+                return $this->startNewBatch();
+            } else {
+                // Time to continue the previous batch
+                return $this->restartBatch();
+            }
+        }
+    }
+
+
+    /**
+     * Returns time delta in ms
+     * If argument is not present, it uses the instantiation time of the EM in seconds
+     * @param $start float Start time in seconds
      * @return float|int
      */
-	public function getRunTime() {
-        return (microtime(true) - $this->ts_start) * 1000;
+	public function getRunTime($start_ts = null) {
+	    if (empty($start_ts)) $start_ts = $this->ts_start ?? 0;
+        return (microtime(true) - $start_ts);
     }
 
 
     /**
-     * Load the batch info
+     * Load the batch info from EM settings
      */
     public function getBatchInfo() {
-	    $this->batch_info = $this->getSystemSetting("batch-info");
+        if (empty($this->batchInfo)) {
+            $this->batchInfo = $this->getSystemSetting("batch-info");
+        }
+        return $this->batchInfo;
+    }
 
+    /**
+     * Save the batch info
+     * @param $batchInfo
+     */
+    public function setBatchInfo($batchInfo) {
+        $this->batchInfo = $batchInfo;
+        $this->setSystemSetting("batch-info", $batchInfo);
     }
 
 
     /**
-     * Called periodically to see if the cron has crashed
-     * @param $cron
-     * @return false
+     * Determine if it is time for the next batch to be started
+     * @return bool
      */
-	public function cronCheckQueue( $cron ) {
-        // $this->emDebug("Cron Fired", $cron);
-
-        // Get PID for last running batch
-        $lastBatch = $this->getSystemSetting("current-batch");
-        $lastProcessId = $this->getSystemSetting("current-batch-process-id");
-
-        // Get the last running alert
-        $currentAlert = $this->getSystemSetting("current-alert");
-        if (empty($currentAlert)) {
-            $this->emDebug("cronCheck - Looks like there are no alerts running - stopping");
-            return false;
-        }
-
-        // Get Queue for last running batch
-        $this->queue = $this->getSystemSetting("queue");
-        if (empty($this->queue)) {
-            // There is nothing to do here - the queue is empty
-            $this->emDebug("cronCheck - empty queue - stopping");
-            return false;
-        }
-
-        // Check if the last batch is still running
-        if (posix_getpgid($lastProcessId)) {
-            $this->emDebug("Process $lastProcessId from batch $lastBatch is still running...");
-            return false;
-        }
-
-        // Appears that the previous job died and maybe left stuff running.
-        $this->emDebug("It appears batch $lastBatch (process $lastProcessId) died while running.  " .
-            "Check error logs.  Let's skip the last job and try to resume", $currentAlert, $this->queue);
-
-        // See if there is time to resume
-        $hoursBetweenBatches = $this->getSystemSetting('hours-between-batches');
-        $nextBatch = $lastBatch + $hoursBetweenBatches * 3600;  // ts of when next batch should cron-start
-        $now = strtotime("now");
-        if ( ($now + $cron['cron_max_run_time']) > $nextBatch) {
-            // We do not have enough time to run
-            $this->emDebug("Given that it is now $now and this cron could run for " . $cron['cron_max_run_time'] .
-                " and the next cron is scheduled at " . $nextBatch . " we do not have enough time to retry");
-            return false;
-        }
-
-        // Check number of retries
-        $this->retries = $this->getSystemSetting("batch-retries");
-        // $maxRetries = $this->getSystemSetting("max-retries");
-        // $maxRetries = empty($maxRetries) ? 2 : $maxRetries;
-        // if ($retries >= $maxRetries) {
-        //     $this->emDebug("Exceeded maximum number of retries: $retries - aborting...");
-        //     return false;
-        // }
-        $this->retries++;
-        $this->setSystemSetting("retries", $this->retries);
-
-        // Let's shift the first member to the end of the array in case this was a failing one to let the others continue...
-        if(count($this->queue) >= 2) {
-            $first = array_shift($this->queue);
-            $this->queue[] = $first;
-            $this->setSystemSetting("queue",$this->queue);
-            $this->emDebug("Queue rotated");
-        }
-
-
-        // Load the alert history
-        $this->alertHistory = $this->getSystemSetting("alert-history");
-
-        // Update the PID to the current one and set the queue
-        $this->setSystemSetting("current-batch-process-id", $this->processId);
-
-        $this->processQueue();
-        $this->emDebug("Reprocessing queue as retry $this->retries");
-	}
-
-
-    /**
-     * Start processing of new batch
-     * batch is named based on timestamp of now
-     * @param $cron
-     * @return false
-     */
-	public function cronInitiateBatch( $cron ) {
-        // $this->emDebug("Cron Fired", $cron);
-
-        $this->batch = strtotime("now");
-
-        // Get the last batch
-        $lastBatch = $this->getSystemSetting("current-batch");
-
-        // Get the minimum hours between batches
-        $hoursBetweenBatches = $this->getSystemSetting("hours-between-batches");
-        $minBetweenBatches = $hoursBetweenBatches * 60;
-
+    public function isTimeForNextBatch() {
         // How long has it been since the last batch
-        $minSinceLastBatch = ( $this->batch - $lastBatch ) / 60;
+        $batchInfo = $this->getBatchInfo();
+        $lastBatchStartTs = $batchInfo['start_ts'] ?? 0;
 
-        if ($minBetweenBatches > $minSinceLastBatch) {
-            $this->emDebug("$minSinceLastBatch minutes since last batch is less than defined gap of $minBetweenBatches mins so we will skip.");
+        $hoursBetweenBatches = $this->getSystemSetting("hours-between-batches");
+        if(empty($hoursBetweenBatches)) {
+            $this->emError("Missing required hours-between-batches");
+            REDCap::logEvent($this->getModuleName() . " Error","Missing required hours-between-batches field");
             return false;
-        } else {
-            $this->emDebug("Min since last batch: $minSinceLastBatch minutes is more than $minBetweenBatches so we will check to start");
         }
 
-        // Check if last batch completed
-        $lastQueue = $this->getSystemSetting("queue");
-        if (!empty($lastQueue)) {
-            $this->emDebug("The last batch did not complete -- the following jobs remain on the queue", $lastQueue);
-            // Email support user
-            global $project_contact_email;
-            REDCap::email($this->getSystemSetting('alert-email'),$project_contact_email,"Error in " . $this->getModuleName(), "Batch $lastBatch did not finish.\n\nRemaining Alert Queue:\n<pre>".print_r($lastQueue,true)."</pre>");
-        }
+        $hoursSinceLastBatch = round( ( $this->ts_start - $lastBatchStartTs ) / 3600, 2);
 
-        // Start a new batch
-        $this->setSystemSetting("current-batch", $this->batch);
+        $isTime = $hoursSinceLastBatch > $hoursBetweenBatches;
+        $this->emDebug("It has been $hoursSinceLastBatch hours since the last batch.",
+            "Your configured batch gap is $hoursBetweenBatches hours.",
+            "It " . ($isTime ? "IS" : "NOT") . " time for a new batch process" );
+        return $isTime;
+    }
 
-        // Set current batch process id
-        $this->setSystemSetting("current-batch-process-id", $this->processId);
+    /**
+     * Start a new batch process
+     * @param false $reverseOrder
+     */
+    public function startNewBatch() {
+        # START A NEW BATCH
+        $queue = $this->getAlertProjectArray();
+        $batchInfo = [
+            "start_ts" => $this->ts_start,
+            "end_ts" => null,
+            "pid" => $this->pid,
+            "failures" => [],
+            "queue" => $queue,
+            "queue_size" => count($queue),
+        ];
+        $this->setBatchInfo($batchInfo);
+        $this->emDebug("Created new batch: {$batchInfo['start_ts']} on process {$batchInfo['pid']} with queue of " . count($queue) . " alerts");
 
-        // Set retries to 0
-        $this->setSystemSetting("batch-retries", 0);
-
-        // Set count to 0...
-        $this->setSystemSetting("batch-count", 0);
-
-        // Get a list of project-alerts that need to be done
-        $jobs = $this->getProjectsWithJobs();
-        $queue = [];
-        foreach($jobs as $alert) {
-            $queue[] = array_merge($alert, [
-                "batch" => $this->batch,
-                "start_process" => $this->processId
-            ]);
-        }
-
-        // Save the new queue
-        $this->setSystemSetting("queue", $queue);
-        $this->setSystemSetting("queue-total", count($queue));
-
-        $this->emDebug("Set batch {$this->batch} queue with " . count($queue) . " alerts");
-
-        // Start processing the queue
-        if (empty($queue)) {
-            $this->emDebug("Nothing in the queue");
-        } else {
-            $this->alertHistory = $this->getSystemSetting("alert-history");
-            $this->queue = $queue;
-            $this->processQueue();
-        }
+        # START TO PROCESS BATCH QUEUE
+        return $this->processQueue();
     }
 
 
+    /**
+     * Restart the batch after a failure
+     */
+    public function restartBatch() {
+        $batchInfo = $this->getBatchInfo();
+        $queue = $batchInfo['queue'];
+        $currentAlert = $this->getProjectSetting('current-alert');
+
+        $batch_runtime = $this->getRunTime($batchInfo['start_ts']);
+
+        // Lets archive the current batchInfo
+        $failure = [
+            'pid' => $batchInfo['pid'],
+            'restarted_ts' => $this->ts_start,    // When this failure was created
+            'batch_runtime' => $batch_runtime,
+            'reverse_order' => $batchInfo['reverse_order'],
+            'queue_size_remaining' => count($queue),
+            'current_alert_failed' => $currentAlert
+        ];
+
+        // Let's reverse the queue to try and get others before the one that failed
+        if(count($queue) >= 2) $queue = array_reverse($queue,true);
+
+        // Save the updated batch
+        $batchInfo['pid'] = $this->pid;
+        $batchInfo['failures'][] = $failure;
+        $batchInfo['queue'] = $queue;
+        $this->setBatchInfo($batchInfo);
+
+        // START TO PROCESS BATCH QUEUE
+        $this->emDebug("Restarted batch: {$batchInfo['start_ts']} on process {$batchInfo['pid']} after " . count($batchInfo['failures']) . " failure(s) with queue size of " . count($queue) . " alerts");
+        return $this->processQueue();
+
+    }
+
+
+    public function emailAlert($msg) {
+        global $project_contact_email;
+        $alert_email = $this->getSystemSetting('alert-email');
+        if (empty($alert_email)) return false;
+        REDCap::email($alert_email,$project_contact_email,"Alert from " . $this->getModuleName(), $msg);
+    }
+
+
+    // /**
+    //  * Start processing of new batch
+    //  * batch is named based on timestamp of now
+    //  * @param $cron
+    //  * @return false
+    //  */
+	// public function cronInitiateBatch( $cron ) {
+    //     $batchInfo = $this->getBatchInfo();
+    //
+    //     # CHECK IF TIME FOR NEW BATCH
+    //
+    //     // Get the minimum mins between batches
+    //     $hoursBetweenBatches = $this->getSystemSetting("hours-between-batches");
+    //     $minBetweenBatches = $hoursBetweenBatches * 60;
+    //
+    //     // How long has it been since the last batch
+    //     $lastBatchStartTs = $batchInfo['start_ts'] ?? 0;
+    //     $minSinceLastBatch = ( $this->ts_start - $lastBatchStartTs ) / 60;
+    //
+    //     // See if we should proceed or abort
+    //     if ($minBetweenBatches > $minSinceLastBatch) {
+    //         $this->emDebug("$minSinceLastBatch minutes since last batch is less than defined gap of $minBetweenBatches mins so we will skip.");
+    //         return false;
+    //     }
+    //     $this->emDebug("Starting new batch - $minSinceLastBatch minutes since last batch is greater than defined gap of $minBetweenBatches mins");
+    //
+    //
+    //     # CHECK TO SEE IF LAST BATCH COMPLETED SUCCESSFULLY
+    //     $queue = $batchInfo['queue'] ?? [];
+    //     $order = $batchInfo['order'] ?? "asc";
+    //     if (!empty($queue)) {
+    //         // Last batch did not complete
+    //         $this->emDebug("The last batch did not complete -- the following jobs remain on the queue:", $queue);
+    //
+    //         // This is not a fatal error - we just email the contact person to let them know.
+    //         global $project_contact_email;
+    //         REDCap::email($this->getSystemSetting('alert-email'),$project_contact_email,"Error in " . $this->getModuleName(), "Last batch did not finish.\n\nRemaining Alert Queue:\n<pre>".print_r($batchInfo,true)."</pre>");
+    //
+    //         // reverse the sort order to try and make sure we cover other alerts on this next pass
+    //         $order = $order === "asc" ? "desc" : "asc";
+    //     }
+    //
+    //
+    //     # START A NEW BATCH
+    //     $queue = $this->getAlertProjectArray($order);
+    //     $batchInfo = [
+    //         "start_ts" => $this->ts_start,
+    //         "end_ts" => null,
+    //         "pid" => $this->pid,
+    //         "failures" => [],
+    //         "queue" => $queue,
+    //         "queue_size" => count($queue),
+    //         "order" => $order
+    //     ];
+    //
+    //     $this->setBatchInfo($batchInfo);
+    //     $this->emDebug("Created new batch: {$batchInfo['start_ts']} on process {$batchInfo['pid']} with queue if " . count($queue) . " alerts");
+    //
+    //
+    //     # PROCESS QUEUE
+    //     if (empty($queue)) {
+    //         $this->emDebug("Nothing in the queue to process");
+    //     } else {
+    //         // $this->alertHistory = $this->getSystemSetting("alert-history");
+    //         // $this->queue = $queue;
+    //         $this->processQueue();
+    //     }
+    // }
+
+
+    /**
+     * Looks at the batch info and processes the queue inside of it
+     * Calls itself until the queue is empty
+     * @return bool
+     */
     public function processQueue() {
 	    // Get Queue of alerts to be processed (from cache)
+        $batchInfo = $this->getBatchInfo();
+        $queue = $batchInfo['queue'];
+        $this->emDebug("Starting processQueue with ", $queue);
 
-        if (empty($this->queue)) {
-            // There is nothing to be done...
-            $this->emError("Queue is empty (shouldn't happen!!) - stop processing");
-            return false;
+        if (empty($queue)) {
+            $batchInfo['end_ts'] = microtime(true);
+            $this->emDebug("Batch Complete", $batchInfo);
+            $batchLog = [];
+            foreach ($batchInfo as $k => $v) {
+                if (is_array($v)) {
+                    $batchLog[$k] = json_encode($v);
+                } else {
+                    $batchLog[$k] = $v;
+                }
+            }
+            $this->log("Batch Complete", $batchLog);
+            $this->setBatchInfo($batchInfo);
+            return null;
         }
 
-        // Get the next alert to process from the queue
-        $alert = array_shift($this->queue);
+        // Shift off first alert to process from the queue
+        reset($queue);
+        $alert_id = key($queue);
+        $project_id = $queue[$alert_id];
+        unset($queue[$alert_id]);
+
+        $currentAlert = [
+            "alert_id" => $alert_id,
+            "project_id" => $project_id,
+            "pid" => $batchInfo['pid'],
+            "start_ts" => microtime(true)
+        ];
 
         // Save alert to database in case of timeout/crash
-        $this->setSystemSetting("current-alert", $alert);
+        $this->setSystemSetting("current-alert", $currentAlert);
 
         // Run the process... this could take a while...
-        $this->emDebug("Processing alert " . $alert['alert_id'] . " from project " . $alert['project_id'] . "...");
+        $this->emDebug("Starting alert $alert_id from project $project_id - " . count($queue) . " remaining");
+        $results = $this->checkProjectAlert($project_id, $alert_id);
 
-        $results = $this->checkProjectAlert($alert['project_id'], $alert['alert_id']);
-        $results['queue_time'] = $this->getRunTime();
-        // $results['batch'] = $this->batch;
-        $results['date_time'] = date("Y-m-d H:i:s", $this->batch);
-
-        // Log results to EM
-        $this->log("Alert Processed", $results);
+        // Clear the current alert
         $this->setSystemSetting("current-alert", "");
-        // $this->setSystemSetting("alert-" . $alert['alert_id'], $results);
 
-        // Save alert Hx
-        $this->alertHistory[$alert['alert_id']] = $results;
-        $this->setSystemSetting('alert-history', $this->alertHistory);
+        // Save the updated batch queue
+        $batchInfo['queue'] = $queue;
+        $batchInfo['duration'] = $this->getRunTime($batchInfo['start_ts']);
+        $this->setBatchInfo($batchInfo);
 
-        // Save the shortened queue
-        $this->setSystemSetting("queue", $this->queue);
+        // Log Results to EM Logs
+        $results = array_merge($results, [
+            "pid" => $batchInfo['pid'],
+            "pid_duration" => $this->getRunTime(),
+            "pid_alert_count" => $this->pid_alert_count++,
+            "batch_start_ts" => $batchInfo['start_ts'],
+            "batch_duration" => $batchInfo['duration'],
+            "failure_count" => count($batchInfo['failures'])
+        ]);
+        $this->log("Alert Processed", $results);
+        $this->emDebug("Alert Processed", $results);
 
-        if (empty($this->queue)) {
-            // All processed
-            $this->emDebug("Batch $this->batch complete");
-            return true;
-        } else {
-            // Recursively process the next item in the queue
-            return $this->processQueue();
-        }
+        // Continue
+        return $this->processQueue();
     }
 
 
     /**
-     * Actually process the alert for notifications one at a time
+     * Actually process the alert for notifications one alert at a time
      * @param $project_id
      * @param $alert_id
      * @return array|false
@@ -266,21 +389,21 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
             return false;
         }
 
-        $ts = microtime(true);
-
+        $start_ts = microtime(true);
         $Alerts = empty($this->Alerts) ? new Alerts : $this->Alerts;
+
         // checkAlertsBulk($project_id=null, $datediffsOnly=false, $alert_ids=array())
         list($num_scheduled_total, $num_removed_total, $count_records_affected) = $Alerts->checkAlertsBulk($project_id, true, $alert_id);
 
-        $duration_ms = (microtime(true) - $ts) * 1000;
+        $duration = $this->getRunTime($start_ts);
 
         $results = [
+            'project_id' => $project_id,
+            'alert_id' => $alert_id,
             'num_scheduled' => $num_scheduled_total,
             'num_removed' => $num_removed_total,
             'count_affected' => $count_records_affected,
-            'project_id' => $project_id,
-            'alert_id' => $alert_id,
-            'duration' => $duration_ms
+            'duration' => $duration
         ];
 
         return $results;
@@ -291,10 +414,8 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
      * Get a list of all project/alerts with datediff to make the queue
      * @return array
      */
-	public function getProjectsWithJobs($array_values = false) {
+	public function getAlertReport($array_values = false) {
         $datediffsOnly = true;
-
-        // Copied / Modified from Alerts->checkAlertsBulk
         $sql1 = $datediffsOnly ? "AND a.form_name is null AND (a.alert_condition like '%datediff%(%today%,%)%' or a.alert_condition like '%datediff%(%now%,%)%')" : "";
 
         // Get a list of all projects that are using active, time-based conditional logic for automated notifications
@@ -303,6 +424,10 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
 				$sql1
 				order by p.project_id desc, a.alert_id";
         $q = db_query($sql);
+
+
+
+
 
         // Load the alert history to merge
         $this->alertHistory = $this->getSystemSetting("alert-history");
@@ -325,6 +450,41 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
             $alerts[] = $array_values ? array_values($alert) : $alert;
         }
 
+        return $alerts;
+    }
+
+
+    /**
+     * Returns an array with key of alert_id and value of project_id
+     * @param $fancy bool Return a json format for html display
+     * @return array
+     */
+    public function getAlertProjectArray($fancy = false) {
+        // Copied / Modified from Alerts->checkAlertsBulk
+        // Get a list of all projects that are using active, time-based conditional logic for automated notifications
+        $sql = "SELECT a.* FROM redcap_alerts a, redcap_projects p
+				WHERE a.email_deleted = 0 AND p.status <= 1 AND p.date_deleted is null
+				  AND p.completed_time is null AND p.project_id = a.project_id
+				  AND a.form_name is null AND (a.alert_condition like '%datediff%(%today%,%)%' or a.alert_condition like '%datediff%(%now%,%)%')
+				ORDER BY a.alert_id asc";
+        $q = db_query($sql);
+
+        $alerts = [];
+        if ($fancy) {
+            // Generate output for webpage view
+            while ($row = db_fetch_assoc($q) ) {
+                $alerts[] = [
+                    "project_id" => $row['project_id'],
+                    "alert_id" => $row['alert_id'],
+                    "title" => $row['alert_title']
+                ];
+            }
+        } else {
+            // Generate output for cron
+            while ($row = db_fetch_assoc($q) ) {
+                $alerts[$row['alert_id']] = $row['project_id'];
+            }
+        }
         return $alerts;
     }
 

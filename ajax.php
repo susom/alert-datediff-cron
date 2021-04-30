@@ -31,8 +31,7 @@ if (!$user->isSuperUser()) {
                 break;
 
             case "getProjectAlerts":
-                $q = $module->getProjectsWithJobs(true);
-                // $module->emDebug($q);
+                $q = $module->getAlertProjectArray(true);
                 $result = [ "data" => $q];
                 break;
 

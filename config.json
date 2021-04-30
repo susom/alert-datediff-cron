@@ -51,7 +51,7 @@
 	"system-settings": [
         {
             "key": "hours-between-batches",
-            "name": "<b>Hours between Full Runs</b> Enter the number of hours between batch runs",
+            "name": "<b>Hours between Full Runs</b> Enter the number of hours between batch runs.  A value of 8 hours is recommended.  This should provide time for up to three retries in case of failures",
             "required": false,
             "type": "dropdown",
             "choices": [
@@ -103,17 +103,10 @@
 
     "crons": [
         {
-            "cron_name": "check-queue",
-            "cron_description": "Cron that runs every 10 minutes to check the queue in case of an error - max run time is 2 hours",
-            "method": "cronCheckQueue",
-            "cron_frequency": "599",
-            "cron_max_run_time": "7200"
-        },
-        {
-            "cron_name": "initiate-batch",
-            "cron_description": "Start a new 'batch' of crons -- this should execute every alert.",
-            "method": "cronInitiateBatch",
-            "cron_frequency": "1800",
+            "cron_name": "em-alert-date-diff-cron",
+            "cron_description": "Cron that runs every 15 minutes to check the queue, restart the queue, or report errors",
+            "method": "cronCheckBatchProcess",
+            "cron_frequency": "900",
             "cron_max_run_time": "7200"
         }
     ],

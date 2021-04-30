@@ -15,7 +15,7 @@ if (!empty($_POST)) {
             break;
 
         case "getProjectAlerts":
-            $alerts = $module->getProjectsWithJobs();
+            $alerts = $module->getAlertProjectArray(true);
             header("Content-type: application/json");
             echo json_encode($alerts);
             break;
@@ -61,11 +61,11 @@ if ($result == "ENABLED") {
                         <th>PID</th>
                         <th>Alert</th>
                         <th>Title</th>
-                        <th>Queue</th>
-                        <th>Batch</th>
-                        <th>DateTime</th>
-                        <th>Scheduled</th>
-                        <th>Duration</th>
+<!--                        <th>Queue</th>-->
+<!--                        <th>Batch</th>-->
+<!--                        <th>DateTime</th>-->
+<!--                        <th>Scheduled</th>-->
+<!--                        <th>Duration</th>-->
                         <th></th>
                     </tr>
                 </thead>
