@@ -314,7 +314,7 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
 	    // Get Queue of alerts to be processed (from cache)
         $batchInfo = $this->getBatchInfo();
         $queue = $batchInfo['queue'];
-        $this->emDebug("Starting processQueue with ", $queue);
+        $this->emDebug("Starting processQueue with " . count($queue) . " alerts to process");
 
         if (empty($queue)) {
             $batchInfo['end_ts'] = microtime(true);
@@ -370,7 +370,7 @@ class AlertDateDiffCron extends \ExternalModules\AbstractExternalModule {
             "failure_count" => count($batchInfo['failures'])
         ]);
         $this->log("Alert Processed", $results);
-        $this->emDebug("Alert Processed", $results);
+        // $this->emDebug("Alert Processed", $results);
 
         // Continue
         return $this->processQueue();

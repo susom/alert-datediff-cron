@@ -82,12 +82,6 @@
             ]
         },
         {
-            "key": "max-retries",
-            "name": "<b>Max Retries</b> Maximum number of times to retry (suggest 2)",
-            "required": "true",
-            "type": "text"
-        },
-        {
             "key": "alert-email",
             "name": "<b>Alert Email</b> Who will be contacted when a job doesn't finish",
             "required": "true",
